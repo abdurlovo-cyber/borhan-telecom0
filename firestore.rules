@@ -1,0 +1,105 @@
+rules_version = '2';
+// BORHAN TELECOM - hardened Firestore rules. Default = DENY (anything not matched below is blocked).
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    function isAdmin() {
+      return signedIn() && (request.auth.token.admin == true
+        || (exists(/databases/$(db)/documents/admins/$(request.auth.uid))
+            && get(/databases/$(db)/documents/admins/$(request.auth.uid)).data.status == 'approved'));
+    }
+    function isDate(s) { return s is string && s.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'); }
+    function isPhone(s) { return s is string && s.matches('^01[3-9][0-9]{8}$'); }
+    function str(v, max) { return v is string && v.size() <= max; }
+    function onlyChanged(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+
+    // ---------- offers ----------
+    function offerOk(d) {
+      return d.keys().hasOnly(['operatorId','operatorName','categoryId','title','internetData','minutes','sms','regularPrice','offerPrice',
+                               'discountPercentage','validity','startDate','expiryDate','description','terms','imageUrl','status','createdAt','updatedAt','createdBy'])
+        && d.keys().hasAll(['operatorId','operatorName','categoryId','title','internetData','minutes','sms','regularPrice','offerPrice',
+                            'discountPercentage','validity','startDate','expiryDate','description','terms','imageUrl','status','updatedAt'])
+        && d.operatorId in ['grameenphone','robi','banglalink','airtel','teletalk']
+        && d.operatorName in ['Grameenphone','Robi','Banglalink','Airtel','Teletalk']
+        && d.categoryId in ['internet','minute','combo','sms','special','discount','latest','popular']
+        && d.title is string && d.title.size() > 0 && d.title.size() <= 120
+        && str(d.internetData, 30) && str(d.minutes, 30) && str(d.sms, 30)
+        && d.regularPrice is number && d.regularPrice > 0 && d.regularPrice <= 100000
+        && d.offerPrice is number && d.offerPrice >= 0 && d.offerPrice <= d.regularPrice
+        && d.discountPercentage is number && d.discountPercentage >= 0 && d.discountPercentage <= 100
+        && d.validity is number && d.validity > 0 && d.validity <= 365
+        && isDate(d.startDate) && isDate(d.expiryDate) && d.expiryDate >= d.startDate
+        && str(d.description, 2000) && str(d.terms, 3000) && str(d.imageUrl, 1000)
+        && d.status in ['active','inactive']
+        && d.updatedAt == request.time;
+    }
+    match /offers/{offerId} {
+      allow get, list: if (resource.data.status == 'active') || isAdmin();
+      allow create: if isAdmin() && offerOk(request.resource.data)
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.createdBy == request.auth.uid;
+      allow update: if isAdmin() && offerOk(request.resource.data)
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.createdBy == resource.data.createdBy;
+      allow delete: if isAdmin();
+    }
+
+    // ---------- customers ----------
+    match /users/{uid} {
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name','phone','email','role','createdAt'])
+        && request.resource.data.keys().hasAll(['name','phone','email','role','createdAt'])
+        && request.resource.data.role == 'customer'
+        && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 80
+        && isPhone(request.resource.data.phone)
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.createdAt == request.time;
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow update: if signedIn() && request.auth.uid == uid && onlyChanged(['name','phone'])
+        && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 80
+        && isPhone(request.resource.data.phone);
+      allow delete: if false;
+    }
+
+    // ---------- admin requests / approvals ----------
+    // Anyone signed in may file ONLY a pending request for themselves. Approval ("status": "approved")
+    // is done by the owner in Firebase Console (console writes bypass rules), never from the client.
+    match /admins/{uid} {
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name','phone','email','status','createdAt'])
+        && request.resource.data.keys().hasAll(['name','phone','email','status','createdAt'])
+        && request.resource.data.status == 'pending'
+        && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 80
+        && isPhone(request.resource.data.phone)
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.createdAt == request.time;
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow update, delete: if false;
+    }
+
+    // ---------- orders ----------
+    match /orders/{orderId} {
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['offerId','offerTitle','operatorName','price','simNumber','userId','userName','userEmail','status','createdAt'])
+        && request.resource.data.keys().hasAll(['offerId','offerTitle','operatorName','price','simNumber','userId','userEmail','status','createdAt'])
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.userEmail == request.auth.token.email
+        && request.resource.data.status == 'pending'
+        && isPhone(request.resource.data.simNumber)
+        && str(request.resource.data.offerTitle, 120) && str(request.resource.data.operatorName, 30) && str(request.resource.data.userName, 80)
+        && request.resource.data.createdAt == request.time
+        && get(/databases/$(db)/documents/offers/$(request.resource.data.offerId)).data.status == 'active'
+        && get(/databases/$(db)/documents/offers/$(request.resource.data.offerId)).data.offerPrice == request.resource.data.price;
+      allow read: if signedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow update: if isAdmin() && onlyChanged(['status']) && request.resource.data.status in ['confirmed','cancelled'];
+      allow delete: if false;   // keep order history
+    }
+
+    // ---------- reference data ----------
+    match /operators/{id}   { allow read: if true; allow write: if isAdmin(); }
+    match /categories/{id}  { allow read: if true; allow write: if isAdmin(); }
+    match /appSettings/{id} { allow read: if true; allow write: if isAdmin(); }
+  }
+}
